@@ -7,7 +7,7 @@ something like this:
 
 ```mermaid
 flowchart LR
-    A[Frontend] --> B[llama-model-router\n]
+    A[Frontend] --> B[llama-model-router]
     B --> C[Default Model Backend]
     B --> D[Dynamic Models Backend]
 ```
