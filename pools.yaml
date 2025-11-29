@@ -1,0 +1,14 @@
+pools:
+  # Pool A: Default model pool
+  - name: "default-pool"
+    endpoints:
+      - "http://host.containers.internal:9001"
+    models:
+      - "gemma3-4b"
+
+  # Pool B: Dynamic model pool (everything else)
+  - name: "dynamic-pool"
+    endpoints:
+      - "http://host.containers.internal:9101"
+    models:
+      - "*"
