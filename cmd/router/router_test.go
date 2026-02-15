@@ -503,13 +503,19 @@ pools:
 			oldPools := cfg.Pools
 
 			// Load config
-			loadConfig(tmpfile.Name())
+			err = loadConfig(tmpfile.Name())
 
 			// Restore config
 			cfg.Pools = oldPools
 
-			if !tc.valid {
-				t.Error("expected config to be invalid")
+			if tc.valid {
+				if err != nil {
+					t.Errorf("expected config to be valid, got error: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Error("expected config to be invalid, got no error")
+				}
 			}
 		})
 	}

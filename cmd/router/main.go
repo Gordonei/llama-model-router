@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -32,14 +33,15 @@ type Config struct {
 var cfg Config
 var sticky sync.Map
 
-func loadConfig(path string) {
+func loadConfig(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		log.Fatalf("failed to read config: %v", err)
+		return fmt.Errorf("failed to read config: %w", err)
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		log.Fatalf("failed to parse config: %v", err)
+		return fmt.Errorf("failed to parse config: %w", err)
 	}
+	return nil
 }
 
 func matchPool(model string) *Pool {
@@ -152,7 +154,9 @@ func main() {
 	listen := flag.String("listen", "0.0.0.0:9090", "host:port to listen on")
 	flag.Parse()
 
-	loadConfig(*configPath)
+	if err := loadConfig(*configPath); err != nil {
+		log.Fatalf("failed to load config: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", handleChat)
