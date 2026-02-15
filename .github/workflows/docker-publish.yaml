@@ -12,7 +12,24 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.4'
+
+      - name: Run tests
+        run: |
+          cd cmd/router
+          go test -v ./...
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
 
     steps:
