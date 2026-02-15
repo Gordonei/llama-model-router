@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -145,6 +146,7 @@ func TestPickEndpoint(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := Pool{Endpoints: tc.endpoints}
+			pool.ResetRR()
 			for i, expected := range tc.expected {
 				actual := pickEndpoint(&pool)
 				if actual != expected {
@@ -251,6 +253,16 @@ func TestHandleChat(t *testing.T) {
 				for j := range cfg.Pools[i].Endpoints {
 					cfg.Pools[i].Endpoints[j] = backend.URL
 				}
+			}
+
+			// Update any pre-configured sticky sessions to use the test backend URL
+			if tc.setupSticky != nil {
+				sticky.Range(func(key, value interface{}) bool {
+					if val, ok := value.(string); ok && strings.Contains(val, "http://backend:8080") {
+						sticky.Store(key, strings.ReplaceAll(val, "http://backend:8080", backend.URL))
+					}
+					return true
+				})
 			}
 
 			// Create request

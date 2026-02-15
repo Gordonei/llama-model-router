@@ -66,8 +66,14 @@ func pickEndpoint(pool *Pool) string {
 	if len(pool.Endpoints) == 1 {
 		return pool.Endpoints[0]
 	}
-	idx := atomic.AddUint64(&pool.rr, 1)
+	idx := atomic.LoadUint64(&pool.rr)
+	atomic.AddUint64(&pool.rr, 1)
 	return pool.Endpoints[int(idx)%len(pool.Endpoints)]
+}
+
+// ResetRR resets the round-robin counter to 0 for testing purposes
+func (p *Pool) ResetRR() {
+	atomic.StoreUint64(&p.rr, 0)
 }
 
 func proxyStream(w http.ResponseWriter, r *http.Request, target string) {
