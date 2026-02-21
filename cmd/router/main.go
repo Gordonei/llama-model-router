@@ -116,18 +116,21 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	json.Unmarshal(body, &rq)
 	key := rq.User + ":" + rq.Model
 	if val, ok := sticky.Load(key); ok {
+		log.Printf("routing to existing endpoint for user/model: %s", key)
 		proxyStream(w, r, val.(string))
 		return
 	}
 
 	pool := matchPool(rq.Model)
 	if pool == nil {
+		log.Printf("no pool found for model: %s", rq.Model)
 		http.Error(w, "no pool for model", 400)
 		return
 	}
 
 	endpoint := pickEndpoint(pool)
 	sticky.Store(key, endpoint)
+	log.Printf("routing to endpoint: %s for user/model: %s", endpoint, key)
 	proxyStream(w, r, endpoint)
 }
 
@@ -151,6 +154,7 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	log.Printf("returning combined models list with %d entries", len(combined))
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(combined)
 }
