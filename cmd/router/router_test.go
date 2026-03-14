@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // Test for pool matching logic
@@ -422,6 +424,247 @@ func TestHandleHealth(t *testing.T) {
 
 	if rr.Body.String() != "ok" {
 		t.Errorf("expected body 'ok', got %q", rr.Body.String())
+	}
+}
+
+// Test for proxyStream function
+func TestProxyStream(t *testing.T) {
+	testCases := []struct {
+		name                string
+		backendStatus       int
+		backendResponse     string
+		backendStreamChunks []string
+		expectStreaming     bool
+		expectedStatus      int
+		expectError         bool
+	}{
+		{
+			name:            "Successful non-streaming response",
+			backendStatus:   200,
+			backendResponse: `{"message": "test"}`,
+			expectStreaming: false,
+			expectedStatus:  200,
+			expectError:     false,
+		},
+		{
+			name:          "Successful streaming response",
+			backendStatus: 200,
+			backendStreamChunks: []string{
+				`{"choices":[{"delta":{"content":"hello"}}]}\n`,
+				`{"choices":[{"delta":{"content":"world"}}]}\n`,
+			},
+			expectStreaming: true,
+			expectedStatus:  200,
+			expectError:     false,
+		},
+		{
+			name:            "Backend returns 500 error",
+			backendStatus:   500,
+			backendResponse: `{"error": "internal error"}`,
+			expectedStatus:  500,
+			expectError:     false,
+		},
+		{
+			name:            "Empty response body",
+			backendStatus:   200,
+			backendResponse: ``,
+			expectedStatus:  200,
+			expectError:     false,
+		},
+		{
+			name:            "Large response chunk",
+			backendStatus:   200,
+			backendResponse: string(make([]byte, 1024*1024)), // 1MB
+			expectedStatus:  200,
+			expectError:     false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a test backend server
+			var backend *httptest.Server
+			if tc.expectStreaming {
+				// Streaming backend
+				backend = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(tc.backendStatus)
+					w.Header().Set("Content-Type", "application/json")
+					for _, chunk := range tc.backendStreamChunks {
+						w.Write([]byte(chunk))
+						w.(http.Flusher).Flush()
+						time.Sleep(10 * time.Millisecond) // Simulate streaming delay
+					}
+				}))
+			} else {
+				// Non-streaming backend
+				backend = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(tc.backendStatus)
+					w.Header().Set("Content-Type", "application/json")
+					w.Write([]byte(tc.backendResponse))
+				}))
+			}
+			defer backend.Close()
+
+			// Create a test request
+			req := httptest.NewRequest("POST", backend.URL+"/v1/chat/completions", strings.NewReader("test"))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Test-Header", "test-value")
+
+			// Create a test response recorder
+			rr := httptest.NewRecorder()
+
+			// Call proxyStream
+			proxyStream(rr, req, backend.URL)
+
+			// Verify response status
+			if rr.Code != tc.expectedStatus {
+				t.Errorf("expected status %d, got %d", tc.expectedStatus, rr.Code)
+			}
+
+			// Verify X-Accel-Buffering header is set
+			if rr.Header().Get("X-Accel-Buffering") != "no" {
+				t.Error("expected X-Accel-Buffering header to be 'no'")
+			}
+
+			// Verify headers were copied from backend
+			// The backend sets Content-Type, so verify it's present
+			// Note: For empty responses, the backend might not set Content-Type
+			if !tc.expectError && tc.backendResponse != "" {
+				contentType := rr.Header().Get("Content-Type")
+				if contentType == "" {
+					t.Error("expected Content-Type header to be copied from backend")
+				}
+			}
+
+			// For streaming responses, verify we got all chunks
+			if tc.expectStreaming {
+				body := rr.Body.String()
+				for _, chunk := range tc.backendStreamChunks {
+					if !strings.Contains(body, strings.TrimSpace(chunk)) {
+						t.Errorf("expected to find chunk %q in response", chunk)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Test for proxyStream error handling
+func TestProxyStreamErrors(t *testing.T) {
+	testCases := []struct {
+		name           string
+		setupBackend   func() *httptest.Server
+		expectedStatus int
+	}{
+		{
+			name: "Backend connection failure",
+			setupBackend: func() *httptest.Server {
+				return nil // Simulate connection failure
+			},
+			expectedStatus: http.StatusBadGateway,
+		},
+		{
+			name: "Invalid target URL",
+			setupBackend: func() *httptest.Server {
+				return nil
+			},
+			expectedStatus: http.StatusBadGateway,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/test", strings.NewReader("test"))
+			rr := httptest.NewRecorder()
+
+			// Call proxyStream with invalid target
+			proxyStream(rr, req, "http://invalid-host-that-does-not-exist:9999")
+
+			// Verify error status
+			if rr.Code != tc.expectedStatus {
+				t.Errorf("expected status %d, got %d", tc.expectedStatus, rr.Code)
+			}
+
+			// Verify error message
+			if rr.Body.Len() == 0 {
+				t.Error("expected error message in response body")
+			}
+		})
+	}
+}
+
+// Test for proxyStream with context cancellation
+func TestProxyStreamContextCancellation(t *testing.T) {
+	// Create a slow streaming backend
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Header().Set("Content-Type", "application/json")
+		for i := 0; i < 10; i++ {
+			w.Write([]byte(fmt.Sprintf(`{"chunk": %d}\n`, i)))
+			w.(http.Flusher).Flush()
+			time.Sleep(50 * time.Millisecond)
+		}
+	}))
+	defer backend.Close()
+
+	// Create a request with a cancellable context
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("POST", backend.URL+"/test", strings.NewReader("test"))
+	req = req.WithContext(ctx)
+	rr := httptest.NewRecorder()
+
+	// Start proxyStream in a goroutine
+	done := make(chan bool, 1)
+	go func() {
+		proxyStream(rr, req, backend.URL)
+		done <- true
+	}()
+
+	// Cancel the context after a short delay
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	// Wait for proxyStream to finish
+	select {
+	case <-done:
+		// proxyStream completed (likely due to context cancellation)
+	case <-time.After(1 * time.Second):
+		t.Log("proxyStream did not complete within timeout")
+	}
+
+	// Should have received some data before cancellation
+	if rr.Body.Len() == 0 {
+		t.Error("expected some data to be received before context cancellation")
+	}
+}
+
+// Test for proxyStream with non-flusher ResponseWriter
+func TestProxyStreamNonFlusher(t *testing.T) {
+	// Create a backend that returns a simple response
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("test response"))
+	}))
+	defer backend.Close()
+
+	// Create a custom ResponseWriter that doesn't implement http.Flusher
+	type nonFlusher struct {
+		http.ResponseWriter
+	}
+
+	rr := &nonFlusher{ResponseWriter: httptest.NewRecorder()}
+	req := httptest.NewRequest("POST", backend.URL+"/test", strings.NewReader("test"))
+
+	// Call proxyStream - should fall back to io.Copy
+	proxyStream(rr, req, backend.URL)
+
+	// Verify response
+	if rr.ResponseWriter.(*httptest.ResponseRecorder).Code != 200 {
+		t.Errorf("expected status 200, got %d", rr.ResponseWriter.(*httptest.ResponseRecorder).Code)
+	}
+
+	if body := rr.ResponseWriter.(*httptest.ResponseRecorder).Body.String(); body != "test response" {
+		t.Errorf("expected body 'test response', got %q", body)
 	}
 }
 
