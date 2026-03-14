@@ -77,29 +77,63 @@ func (p *Pool) ResetRR() {
 }
 
 func proxyStream(w http.ResponseWriter, r *http.Request, target string) {
+	// 1. Create the backend request
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target+r.URL.Path, r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	req.Header = r.Header.Clone()
 
+	// 2. Execute the request
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
+	// 3. Copy headers from backend to client
 	for k, vals := range resp.Header {
 		for _, v := range vals {
 			w.Header().Add(k, v)
 		}
 	}
+
+	// Explicitly tell any upstream proxies (like Nginx) not to buffer this
+	w.Header().Set("X-Accel-Buffering", "no")
+
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+
+	// 4. Set up the Flusher
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		// If the ResponseWriter doesn't support flushing, we fall back to standard copy.
+		// This might happen with some middleware or very old HTTP/1.0 clients.
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	// 5. The Streaming Loop
+	// We use a small buffer. Every time the backend sends data, we write and flush.
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				// If the client (llama-benchy) disconnects, stop proxing.
+				return
+			}
+			// Push the data to the client immediately
+			flusher.Flush()
+		}
+		if err != nil {
+			// io.EOF is expected when the stream finishes normally
+			break
+		}
+	}
 }
 
 func handleChat(w http.ResponseWriter, r *http.Request) {
