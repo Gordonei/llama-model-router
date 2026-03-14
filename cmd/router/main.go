@@ -7,16 +7,17 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"gopkg.in/yaml.v3"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 type Pool struct {
@@ -76,61 +77,77 @@ func (p *Pool) ResetRR() {
 	atomic.StoreUint64(&p.rr, 0)
 }
 
-func proxyStream(w http.ResponseWriter, r *http.Request, target string) {
-	// 1. Create the backend request
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, target+r.URL.Path, r.Body)
+func proxyStream(w http.ResponseWriter, r *http.Request, target string, body []byte) {
+	// 1. Parse target to ensure we handle URLs correctly
+	targetURL, err := url.Parse(target)
+	if err != nil {
+		http.Error(w, "Invalid target URL", http.StatusInternalServerError)
+		return
+	}
+
+	// 2. Build the full destination path
+	// This avoids double slashes and ensures query parameters are preserved
+	destPath := strings.TrimSuffix(target, "/") + r.URL.Path
+	if r.URL.RawQuery != "" {
+		destPath += "?" + r.URL.RawQuery
+	}
+
+	// 3. Create the backend request
+	// Note: If you read r.Body before this, you MUST pass a new Reader here.
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, destPath, bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	// 4. Clone headers and fix the Host
 	req.Header = r.Header.Clone()
+	req.Host = targetURL.Host
+	req.ContentLength = int64(len(body))
+	req.Header.Del("Transfer-Encoding")
 
-	// 2. Execute the request
+	// 5. Execute the request
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, "Backend unreachable: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	// 3. Copy headers from backend to client
-	for k, vals := range resp.Header {
-		for _, v := range vals {
+	// 6. Transfer headers from backend to client
+	for k, vv := range resp.Header {
+		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
 
-	// Explicitly tell any upstream proxies (like Nginx) not to buffer this
-	w.Header().Set("X-Accel-Buffering", "no")
+	// CRITICAL: Strip headers that interfere with chunked streaming.
+	// We delete Content-Length so Go's server can manage the chunked EOF properly.
+	w.Header().Del("Content-Length")
+	w.Header().Del("Connection")
+	w.Header().Del("Keep-Alive")
+	w.Header().Set("X-Accel-Buffering", "no") // Prevent Nginx buffering
 
+	// 7. Initialize status and Flusher
 	w.WriteHeader(resp.StatusCode)
+	flusher, canFlush := w.(http.Flusher)
 
-	// 4. Set up the Flusher
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		// If the ResponseWriter doesn't support flushing, we fall back to standard copy.
-		// This might happen with some middleware or very old HTTP/1.0 clients.
-		io.Copy(w, resp.Body)
-		return
-	}
-
-	// 5. The Streaming Loop
-	// We use a small buffer. Every time the backend sends data, we write and flush.
+	// 8. The Streaming Loop
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				// If the client (llama-benchy) disconnects, stop proxing.
+				// Client likely disconnected (benchy stopped)
 				return
 			}
-			// Push the data to the client immediately
-			flusher.Flush()
+			if canFlush {
+				flusher.Flush()
+			}
 		}
 		if err != nil {
-			// io.EOF is expected when the stream finishes normally
+			// io.EOF means the stream ended naturally
 			break
 		}
 	}
@@ -144,14 +161,14 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 
 	var rq Req
 	body, _ := io.ReadAll(r.Body)
-	r.Body.Close()
-	r.Body = io.NopCloser(bytes.NewReader(body))
+	// r.Body.Close()
+	// r.Body = io.NopCloser(bytes.NewReader(body))
 
 	json.Unmarshal(body, &rq)
 	key := rq.User + ":" + rq.Model
 	if val, ok := sticky.Load(key); ok {
 		log.Printf("routing to existing endpoint for user/model: %s", key)
-		proxyStream(w, r, val.(string))
+		proxyStream(w, r, val.(string), body)
 		return
 	}
 
@@ -165,7 +182,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	endpoint := pickEndpoint(pool)
 	sticky.Store(key, endpoint)
 	log.Printf("routing to endpoint: %s for user/model: %s", endpoint, key)
-	proxyStream(w, r, endpoint)
+	proxyStream(w, r, endpoint, body)
 }
 
 func handleModels(w http.ResponseWriter, r *http.Request) {
@@ -204,7 +221,12 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", handleChat)
+	mux.HandleFunc("/chat/completions", handleChat)
 	mux.HandleFunc("/v1/models", handleModels)
+	mux.HandleFunc("/models", handleModels)
+	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})

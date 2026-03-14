@@ -514,7 +514,8 @@ func TestProxyStream(t *testing.T) {
 			rr := httptest.NewRecorder()
 
 			// Call proxyStream
-			proxyStream(rr, req, backend.URL)
+			body := []byte("test")
+			proxyStream(rr, req, backend.URL, body)
 
 			// Verify response status
 			if rr.Code != tc.expectedStatus {
@@ -578,7 +579,8 @@ func TestProxyStreamErrors(t *testing.T) {
 			rr := httptest.NewRecorder()
 
 			// Call proxyStream with invalid target
-			proxyStream(rr, req, "http://invalid-host-that-does-not-exist:9999")
+			body := []byte("test")
+			proxyStream(rr, req, "http://invalid-host-that-does-not-exist:9999", body)
 
 			// Verify error status
 			if rr.Code != tc.expectedStatus {
@@ -615,8 +617,9 @@ func TestProxyStreamContextCancellation(t *testing.T) {
 
 	// Start proxyStream in a goroutine
 	done := make(chan bool, 1)
+	body := []byte("test")
 	go func() {
-		proxyStream(rr, req, backend.URL)
+		proxyStream(rr, req, backend.URL, body)
 		done <- true
 	}()
 
@@ -656,7 +659,8 @@ func TestProxyStreamNonFlusher(t *testing.T) {
 	req := httptest.NewRequest("POST", backend.URL+"/test", strings.NewReader("test"))
 
 	// Call proxyStream - should fall back to io.Copy
-	proxyStream(rr, req, backend.URL)
+	body := []byte("test")
+	proxyStream(rr, req, backend.URL, body)
 
 	// Verify response
 	if rr.ResponseWriter.(*httptest.ResponseRecorder).Code != 200 {
